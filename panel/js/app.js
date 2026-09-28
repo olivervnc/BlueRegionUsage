@@ -53,6 +53,7 @@
     modelCatalog: [],       // 网关可用模型列表 [{id, credit, creditHistory}]
     creditMap: {},          // 模型 id -> 当前生效 Credit 系数（null = 未提供，展示降级 --）
     creditHistMap: {},      // 模型 id -> [{from, credit}] 系数版本历史（按生效日升序）
+    catalogSyncedAt: null,  // 模型目录最近一次成功同步时间（Date，来自缓存或本次请求）
     period: 'today',
     cooldownTimer: null,
     cooldownLeft: 0,
@@ -62,6 +63,11 @@
     tableSort: { key: 'total_tokens', dir: -1 },
     cache: { trend: null, hourly: null, model: null, provider: null, byModelMonth: null } // 主题切换重建图表用
   };
+
+  // ---------- 本地缓存（window.BRU.cache）----------
+  // 网关 403（Key 超量临时封禁）等异常时回退最近一次成功快照：
+  // 目录/.consumer 无 TTL 长期有效；用量快照按 period:endpoint 存储，超 30 天丢弃。
+  var CACHE = window.BRU.cache;
 
   // ---------- DOM 工具 ----------
   function $(id) { return document.getElementById(id); }
@@ -444,14 +450,30 @@
     if (state.inFlight) return Promise.resolve();
     state.inFlight = true;
     var isToday = state.period === 'today';
-    setKpiState('loading');
-    setCardState($('card-trend'), 'loading');
-    setCardState($('card-model'), 'loading');
-    setCardState($('card-provider'), 'loading');
-    setCardState($('card-table'), 'loading');
+    // 布局先行：先切 grid 布局（趋势通铺/分时占位），再渲染内容，避免预载异常时布局错乱
     var chartsGrid = document.querySelector('.charts-grid');
-    if (isToday) { chartsGrid.classList.remove('no-hourly'); show($('card-hourly')); setCardState($('card-hourly'), 'loading'); }
-    else { chartsGrid.classList.add('no-hourly'); hide($('card-hourly')); }
+    if (isToday) {
+      chartsGrid.classList.remove('no-hourly');
+      show($('card-hourly'));
+    } else {
+      chartsGrid.classList.add('no-hourly');
+      hide($('card-hourly'));
+    }
+    // 离线优先：先渲染当前周期缓存快照（无骨架屏等待，秒开），后台请求成功后覆盖
+    var preloaded = false;
+    try { preloaded = renderCurrentPeriodFromCache(); } catch (e) { /* 缓存数据异常时降级骨架屏 */ }
+    setKpiState(preloaded ? 'ready' : 'loading');
+    setCardState($('card-trend'), preloaded ? 'ready' : 'loading');
+    setCardState($('card-model'), preloaded ? 'ready' : 'loading');
+    setCardState($('card-provider'), preloaded ? 'ready' : 'loading');
+    setCardState($('card-table'), preloaded ? 'ready' : 'loading');
+    if (isToday) {
+      if (!preloaded || CACHE.readUsage(state.cfg.gatewayBaseUrl, 'today', 'hourly')) {
+        setCardState($('card-hourly'), 'ready');
+      } else {
+        setCardState($('card-hourly'), 'loading');
+      }
+    }
 
     return fetchAll(state.cfg).then(function (res) {
       state.inFlight = false;
@@ -467,17 +489,23 @@
       }
 
       var anyFail = false;
+      var restrictedFail = false; // 是否因 403 受限（封禁）失败 → 回退缓存展示
 
       // --- KPI（全周期统一走 summary，自带环比 compare） ---
       if (res.summary.status === 'fulfilled') {
         var v = res.summary.value;
         var d = v.data;
-        var cached = d.cached_tokens || 0;
+        // consumer 回显落缓存（403 时徽标可能拿不到，这里是最可靠的来源）
+        if (v.consumer) {
+          state.consumer = v.consumer;
+          CACHE.saveConsumer(state.cfg.gatewayBaseUrl, v.consumer);
+        }
+        CACHE.saveUsage(state.cfg.gatewayBaseUrl, state.period, 'summary', v);
         renderKpis({
           requestCount: d.request_count,
           totalTokens: (d.req_tokens || 0) + (d.rsp_tokens || 0),
-          uncachedTokens: Math.max((d.req_tokens || 0) - cached, 0),
-          cachedTokens: cached,
+          uncachedTokens: Math.max((d.req_tokens || 0) - (d.cached_tokens || 0), 0),
+          cachedTokens: d.cached_tokens || 0,
           rspTokens: d.rsp_tokens,
           cacheHitRate: d.cache_hit_rate,
           cacheRateText: F.hitRate(d.cache_hit_rate),
@@ -489,7 +517,11 @@
         $('last-updated').textContent = '更新于 ' + F.timeOfDay(v.as_of);
       } else {
         anyFail = true;
-        setKpiState('error', res.summary.reason && res.summary.reason.message);
+        restrictedFail = restrictedFail || (res.summary.reason && res.summary.reason.code === 'restricted');
+        // 403/网络失败 → 回退缓存渲染 KPI（若有快照）
+        if (!renderSummaryFromCache()) {
+          setKpiState('error', res.summary.reason && res.summary.reason.message);
+        }
       }
 
       // --- 每日趋势 ---
@@ -501,6 +533,7 @@
       // --- 模型分布 / 明细表（共用 by-model） ---
       if (res.byModel.status === 'fulfilled') {
         var list = res.byModel.value.data || [];
+        CACHE.saveUsage(state.cfg.gatewayBaseUrl, state.period, 'byModel', res.byModel.value);
         state.cache.model = list;
         state.tableRows = list;
         renderModelChart(list);
@@ -508,18 +541,36 @@
         renderCreditKpi(list);
       } else {
         anyFail = true;
-        setCardState($('card-model'), 'error', res.byModel.reason && res.byModel.reason.message);
-        setCardState($('card-table'), 'error', res.byModel.reason && res.byModel.reason.message);
+        restrictedFail = restrictedFail || (res.byModel.reason && res.byModel.reason.code === 'restricted');
+        var byModelSnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'byModel');
+        if (byModelSnap) {
+          state.cache.model = byModelSnap.data.data || [];
+          state.tableRows = state.cache.model;
+          renderModelChart(state.cache.model);
+          renderTable(state.cache.model);
+          renderCreditKpi(state.cache.model);
+        } else {
+          setCardState($('card-model'), 'error', res.byModel.reason && res.byModel.reason.message);
+          setCardState($('card-table'), 'error', res.byModel.reason && res.byModel.reason.message);
+        }
       }
 
       // --- 供应商分布 ---
       if (res.byProvider.status === 'fulfilled') {
         var plist = res.byProvider.value.data || [];
+        CACHE.saveUsage(state.cfg.gatewayBaseUrl, state.period, 'byProvider', res.byProvider.value);
         state.cache.provider = plist;
         renderProviderChart(plist);
       } else {
         anyFail = true;
-        setCardState($('card-provider'), 'error', res.byProvider.reason && res.byProvider.reason.message);
+        restrictedFail = restrictedFail || (res.byProvider.reason && res.byProvider.reason.code === 'restricted');
+        var byProviderSnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'byProvider');
+        if (byProviderSnap) {
+          state.cache.provider = byProviderSnap.data.data || [];
+          renderProviderChart(state.cache.provider);
+        } else {
+          setCardState($('card-provider'), 'error', res.byProvider.reason && res.byProvider.reason.message);
+        }
       }
 
       // --- 本月累计 Credit 进度条（月均 pacing，独立于分页） ---
@@ -527,15 +578,31 @@
         state.cache.byModelMonth = res.byModel.status === 'fulfilled' ? (res.byModel.value.data || []) : null;
       } else if (res.byModelMonth && res.byModelMonth.status === 'fulfilled') {
         state.cache.byModelMonth = res.byModelMonth.value.data || [];
+        CACHE.saveUsage(state.cfg.gatewayBaseUrl, 'month', 'byModelMonth', res.byModelMonth.value);
       } else {
         state.cache.byModelMonth = null;
+      }
+      // 非本月分页且本月拉取失败 → 回退缓存月度快照
+      if (state.period !== 'month' && !state.cache.byModelMonth) {
+        var monthSnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, 'month', 'byModelMonth');
+        if (monthSnap) state.cache.byModelMonth = monthSnap.data.data || [];
+      }
+      if (state.period === 'month' && !state.cache.byModelMonth) {
+        var monthSnap2 = CACHE.readUsage(state.cfg.gatewayBaseUrl, 'month', 'byModel');
+        if (monthSnap2) state.cache.byModelMonth = monthSnap2.data.data || [];
       }
       renderQuotaBar(state.cache.byModelMonth);
 
       // --- 失败 Header 提示 ---
       if (anyFail) {
         state.consecutiveFails++;
-        showHeaderNotice('部分数据加载失败，将在下次刷新时重试', 'warn');
+        if (restrictedFail) {
+          var allFromCache = renderStatusFromCache();
+          showHeaderNotice('API Key 被限制访问（403，可能因超量被临时封禁）' +
+            (allFromCache ? '，当前展示最近一次成功获取的缓存数据' : ''), 'warn');
+        } else {
+          showHeaderNotice('部分数据加载失败，将在下次刷新时重试', 'warn');
+        }
       } else {
         state.consecutiveFails = 0;
         hideHeaderNotice();
@@ -548,23 +615,120 @@
     });
   }
 
+  /** summary 快照回退渲染；成功返回 true（有快照且渲染了 KPI） */
+  function renderSummaryFromCache() {
+    var snap = CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'summary');
+    if (!snap) return false;
+    var v = snap.data, d = v.data;
+    renderKpis({
+      requestCount: d.request_count,
+      totalTokens: (d.req_tokens || 0) + (d.rsp_tokens || 0),
+      uncachedTokens: Math.max((d.req_tokens || 0) - (d.cached_tokens || 0), 0),
+      cachedTokens: d.cached_tokens || 0,
+      rspTokens: d.rsp_tokens,
+      cacheHitRate: d.cache_hit_rate,
+      cacheRateText: F.hitRate(d.cache_hit_rate),
+      ttftMs: null,
+      compare: v.compare || null,
+      compareLabel: COMPARE_LABELS[(v.compare || {}).window] || '环比'
+    });
+    setKpiState('ready');
+    $('last-updated').textContent = '更新于 ' + F.timeOfDay(v.as_of) + '（缓存 ' + F.dateTime(new Date(snap.at)) + '）';
+    return true;
+  }
+
+  /**
+   * 离线优先：用当前周期的缓存快照渲染全部数据区（KPI/趋势/分布/明细/月进度条）。
+   * 返回是否有任一快照被渲染。后台请求完成后 loadAll 的 then 分支会覆盖为最新数据。
+   */
+  function renderCurrentPeriodFromCache() {
+    var any = false;
+    // KPI（summary 快照，含环比）
+    if (renderSummaryFromCache()) any = true;
+    // 趋势图（daily 快照）
+    var trendSnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'daily');
+    if (trendSnap) {
+      state.cache.trend = trendSnap.data.data || [];
+      renderTrendChart(state.cache.trend);
+      any = true;
+    }
+    // 分时图（hourly 仅今日周期）
+    if (state.period === 'today') {
+      var hourlySnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, 'today', 'hourly');
+      if (hourlySnap) {
+        state.cache.hourly = hourlySnap.data.data || [];
+        renderHourlyChart(state.cache.hourly);
+        any = true;
+      }
+    }
+    // 模型分布 + 明细表（byModel 快照）
+    var byModelSnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'byModel');
+    if (byModelSnap) {
+      state.cache.model = byModelSnap.data.data || [];
+      state.tableRows = state.cache.model;
+      renderModelChart(state.cache.model);
+      renderTable(state.cache.model);
+      renderCreditKpi(state.cache.model);
+      any = true;
+    }
+    // 供应商分布
+    var byProviderSnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'byProvider');
+    if (byProviderSnap) {
+      state.cache.provider = byProviderSnap.data.data || [];
+      renderProviderChart(state.cache.provider);
+      any = true;
+    }
+    // 月进度条（byModelMonth 或月周期 byModel 快照）
+    var monthSnap = CACHE.readUsage(state.cfg.gatewayBaseUrl, 'month', 'byModelMonth') ||
+      CACHE.readUsage(state.cfg.gatewayBaseUrl, 'month', 'byModel');
+    if (monthSnap) {
+      state.cache.byModelMonth = monthSnap.data.data || [];
+      renderQuotaBar(state.cache.byModelMonth);
+      any = true;
+    }
+    return any;
+  }
+
+  /** 受限/失败时标注数据来源为缓存：所有卡片若为快照渲染，在 Header 时间处汇总标注 */
+  function renderStatusFromCache() {
+    var parts = [];
+    if (CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'summary')) parts.push('KPI');
+    if (CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'byModel')) parts.push('明细');
+    if (CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'byProvider')) parts.push('分布');
+    return parts.length > 0;
+  }
+
   function handleTrend(dailyResult) {
     if (dailyResult.status === 'fulfilled') {
       var rows = dailyResult.value.data || [];
+      CACHE.saveUsage(state.cfg.gatewayBaseUrl, state.period, 'daily', dailyResult.value);
       state.cache.trend = rows;
       renderTrendChart(rows);
     } else {
-      setCardState($('card-trend'), 'error', dailyResult.reason && dailyResult.reason.message);
+      var snap = CACHE.readUsage(state.cfg.gatewayBaseUrl, state.period, 'daily');
+      if (snap) {
+        state.cache.trend = snap.data.data || [];
+        renderTrendChart(state.cache.trend);
+      } else {
+        setCardState($('card-trend'), 'error', dailyResult.reason && dailyResult.reason.message);
+      }
     }
   }
 
   function handleHourly(hourlyResult) {
     if (hourlyResult && hourlyResult.status === 'fulfilled') {
       var rows = hourlyResult.value.data || [];
+      CACHE.saveUsage(state.cfg.gatewayBaseUrl, 'today', 'hourly', hourlyResult.value);
       state.cache.hourly = rows;
       renderHourlyChart(rows);
     } else {
-      setCardState($('card-hourly'), 'error', hourlyResult && hourlyResult.reason && hourlyResult.reason.message);
+      var snap = CACHE.readUsage(state.cfg.gatewayBaseUrl, 'today', 'hourly');
+      if (snap) {
+        state.cache.hourly = snap.data.data || [];
+        renderHourlyChart(state.cache.hourly);
+      } else {
+        setCardState($('card-hourly'), 'error', hourlyResult && hourlyResult.reason && hourlyResult.reason.message);
+      }
     }
   }
 
@@ -580,32 +744,28 @@
     var card = $('card-trend');
     if (!rows.length) { setCardState(card, 'empty'); return; }
     setCardState(card, 'ready');
-    var chart = CH.init('trend', $('chart-trend'));
-    if (chart) chart.setOption(CH.trendOption(rows, fmt()));
+    CH.setOption('trend', $('chart-trend'), CH.trendOption(rows, fmt()));
   }
 
   function renderHourlyChart(rows) {
     var card = $('card-hourly');
     if (!rows.length) { setCardState(card, 'empty'); return; }
     setCardState(card, 'ready');
-    var chart = CH.init('hourly', $('chart-hourly'));
-    if (chart) chart.setOption(CH.hourlyOption(rows, fmt()));
+    CH.setOption('hourly', $('chart-hourly'), CH.hourlyOption(rows, fmt()));
   }
 
   function renderModelChart(list) {
     var card = $('card-model');
     if (!list.length) { setCardState(card, 'empty'); return; }
     setCardState(card, 'ready');
-    var chart = CH.init('model', $('chart-model'));
-    if (chart) chart.setOption(CH.modelBarOption(list, fmt()));
+    CH.setOption('model', $('chart-model'), CH.modelBarOption(list, fmt()));
   }
 
   function renderProviderChart(list) {
     var card = $('card-provider');
     if (!list.length) { setCardState(card, 'empty'); return; }
     setCardState(card, 'ready');
-    var chart = CH.init('provider', $('chart-provider'));
-    if (chart) chart.setOption(CH.providerDonutOption(list, fmt()));
+    CH.setOption('provider', $('chart-provider'), CH.providerDonutOption(list, fmt()));
   }
 
   /** 主题切换后用缓存数据重建图表 */
@@ -617,6 +777,11 @@
   }
 
   // ---------- 可用模型目录（/v1/models） ----------
+  /** 当前 state.modelCatalog 是否来自本次会话成功同步（而非 403 回退缓存） */
+  function isFreshCatalog() {
+    return state.catalogSyncedAt && (Date.now() - state.catalogSyncedAt.getTime()) < 5 * 60 * 1000;
+  }
+
   /** 落库模型目录并构建 Credit 映射（models: [{id, credit, creditHistory}]） */
   function setModelCatalog(models) {
     state.modelCatalog = models;
@@ -637,8 +802,21 @@
     }).join('\n');
   }
 
-  /** 目录表：三对"模型 | Credit 系数"列紧凑排布；系数缺失显示 --，悬停看版本历史 */
+  /** 目录表：三对"模型 | Credit 系数"列紧凑排布；系数缺失显示 --，悬停看版本历史；
+   *  使用缓存目录时标题标记最近同步时间 */
   function renderModelCatalog(models) {
+    var note = $('catalog-sync-note');
+    if (note) {
+      if (state.catalogSyncedAt && !isFreshCatalog()) {
+        note.textContent = '（缓存 · 同步于 ' + F.dateTime(state.catalogSyncedAt) + '）';
+        note.title = '当前为最近一次成功同步的模型目录缓存（/v1/models 暂不可用）';
+        show(note);
+      } else {
+        note.textContent = '';
+        note.title = '';
+        hide(note);
+      }
+    }
     $('catalog-count').textContent = models.length ? '（' + models.length + ' 个）' : '';
     var tbody = $('catalog-tbody');
     tbody.innerHTML = '';
@@ -823,7 +1001,9 @@
   // ---------- 连通徽标 ----------
   /**
    * 调稳定的 /v1/models 探测连通性：
-   * 成功 → 绿勾 + 消费者 ID，并落版"可用模型"目录卡；失败 → 红叉 + 未连接
+   * 成功 → 绿勾 + 消费者 ID，落库目录并写缓存；403（超量封禁等）→ 橙色受限徽标，
+   * 目录回退 localStorage 缓存（无缓存则空目录），仍然进面板查用量；
+   * 其他失败 → 红叉 + 未连接
    */
   function refreshConnBadge() {
     var badge = $('header-conn'), label = $('header-consumer');
@@ -832,15 +1012,39 @@
     label.textContent = '连接中…';
     badge.title = '正在调用 /v1/models 检测网关连通性…';
     API.testConnection(state.cfg).then(function (r) {
-      if (r.ok) {
+      if (r.ok && !r.restricted) {
         state.consumer = r.consumer;
+        CACHE.saveConsumer(state.cfg.gatewayBaseUrl, r.consumer);
         setModelCatalog(r.models);
+        state.catalogSyncedAt = new Date();
+        CACHE.saveCatalog(state.cfg.gatewayBaseUrl, r.models);
         badge.className = 'conn-badge conn-ok';
         label.textContent = r.consumer || '已连接';
         badge.title = '已连接网关，鉴权通过\n消费者：' + (r.consumer || '-') +
           '\n可用模型 ' + r.models.length + ' 个：' + r.modelIds.join('、');
         renderModelCatalog(r.models);
         // 目录载入后 Credit 系数才可用，补渲染用量卡与月进度条（消除与 by-model 的竞态）
+        if (state.cache.model) renderCreditKpi(state.cache.model);
+        if (state.cache.byModelMonth) renderQuotaBar(state.cache.byModelMonth);
+      } else if (r.ok && r.restricted) {
+        // Key 有效但被限制（如超量临时封禁）：consumer/目录回退缓存，用量接口照常尝试
+        var cached = CACHE.readCatalog(state.cfg.gatewayBaseUrl);
+        state.consumer = CACHE.readConsumer(state.cfg.gatewayBaseUrl) || '';
+        if (cached) {
+          setModelCatalog(cached.models);
+          state.catalogSyncedAt = new Date(cached.syncedAt);
+          renderModelCatalog(cached.models);
+        } else {
+          setModelCatalog([]);
+          state.catalogSyncedAt = null;
+          renderModelCatalog([]);
+        }
+        badge.className = 'conn-badge conn-restricted';
+        label.textContent = state.consumer || '受限访问';
+        badge.title = '网关鉴权通过，但 /v1/models 返回 403（Key 可能因超量被临时封禁）\n' +
+          '消费者：' + (state.consumer || '未知（无缓存）') +
+          '\n模型目录' + (cached ? '来自缓存（同步于 ' + F.dateTime(state.catalogSyncedAt) + '）' : '暂无缓存可用') +
+          '\n用量数据若拉取失败将展示最近缓存';
         if (state.cache.model) renderCreditKpi(state.cache.model);
         if (state.cache.byModelMonth) renderQuotaBar(state.cache.byModelMonth);
       } else {
@@ -879,7 +1083,7 @@
       API.testConnection(cfg).then(function (r) {
         btn.disabled = false;
         btn.textContent = '测试连接';
-        if (r.ok) {
+        if (r.ok && !r.restricted) {
           state.cfg = cfg;
           state.consumer = r.consumer;
           setModelCatalog(r.models);
@@ -888,6 +1092,19 @@
             '\n可用模型 ' + r.models.length + ' 个：' + r.modelIds.join('、') +
             '\n\n是否将配置保存到浏览器 localStorage？\n（下次打开免输入；选择"取消"则仅本次会话生效）')) {
             C.saveLocal(cfg);
+          }
+          enterPanel();
+        } else if (r.ok && r.restricted) {
+          // 403：Key 有效但被限制（如超量临时封禁），放行进面板；consumer/目录回退缓存
+          state.cfg = cfg;
+          var cached = CACHE.readCatalog(cfg.gatewayBaseUrl);
+          state.consumer = CACHE.readConsumer(cfg.gatewayBaseUrl) || '';
+          if (cached) {
+            setModelCatalog(cached.models);
+            state.catalogSyncedAt = new Date(cached.syncedAt);
+          } else {
+            setModelCatalog([]);
+            state.catalogSyncedAt = null;
           }
           enterPanel();
         } else {
@@ -908,8 +1125,23 @@
   function enterPanel() {
     switchView('panel');
     applyTheme(false);
+    preloadFromCache();
     refreshConnBadge();
     loadAll();
+  }
+
+  /** 离线优先：进面板同步预载缓存 consumer/目录（testConnection 未返回时也能渲染 Credit 与目录表） */
+  function preloadFromCache() {
+    if (!state.cfg) return;
+    if (!state.consumer) state.consumer = CACHE.readConsumer(state.cfg.gatewayBaseUrl) || '';
+    if (!state.modelCatalog.length) {
+      var cat = CACHE.readCatalog(state.cfg.gatewayBaseUrl);
+      if (cat) {
+        setModelCatalog(cat.models);
+        state.catalogSyncedAt = new Date(cat.syncedAt);
+        renderModelCatalog(cat.models);
+      }
+    }
   }
 
   // ---------- 设置抽屉 ----------
@@ -983,9 +1215,11 @@
       API.testConnection(cfg).then(function (r) {
         btn.disabled = false;
         btn.textContent = '测试连接';
-        if (r.ok) {
+        if (r.ok && !r.restricted) {
           drawerMessage('连接成功 · 消费者 ' + (r.consumer || '-') +
             ' · 可用模型 ' + r.models.length + ' 个：' + r.modelIds.join('、'), true);
+        } else if (r.ok && r.restricted) {
+          drawerMessage('鉴权通过，但 /v1/models 返回 403（Key 可能因超量被临时封禁）；用量查询不受影响', true);
         } else {
           drawerMessage((r.error && r.error.message) || '连接失败');
         }

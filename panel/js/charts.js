@@ -6,24 +6,51 @@
   'use strict';
 
   var instances = {}; // name -> echarts instance
+  var observers = {}; // name -> ResizeObserver（容器尺寸变化时自动 resize，如切周期 grid 重排）
 
   function isDark() {
     return document.documentElement.getAttribute('data-theme') === 'dark';
   }
 
-  /** 初始化（已存在则先销毁）。返回实例或 null（DOM 不存在时） */
+  /**
+   * 获取图表实例：已存在则复用（仅 setOption 数据过渡，无重复入场动画），
+   * 不存在才 init 创建。主题切换时由 disposeAll 清空后走创建路径。
+   */
   function init(name, el) {
     if (!el) return null;
-    dispose(name);
+    if (instances[name] && !instances[name].isDisposed()) return instances[name];
     var chart = window.echarts.init(el, isDark() ? 'dark' : null, { renderer: 'canvas' });
     instances[name] = chart;
+    // 容器尺寸变化（切周期 grid 通铺/窗口缩放/卡片显隐）时自动 resize 画布
+    if (window.ResizeObserver && !observers[name]) {
+      observers[name] = new ResizeObserver(function () {
+        if (instances[name] && !instances[name].isDisposed()) instances[name].resize();
+      });
+      observers[name].observe(el);
+    }
     return chart;
+  }
+
+  /** 更新数据：首次渲染播入场动画；复用实例的更新（缓存预载 → 网络覆盖）关动画瞬时完成 */
+  function setOption(name, el, option) {
+    var chart = init(name, el);
+    if (!chart) return;
+    if (!chart.__rendered) {
+      chart.__rendered = true;
+      chart.setOption(option);
+    } else {
+      chart.setOption(Object.assign({ animation: false }, option), { lazyUpdate: true });
+    }
   }
 
   function dispose(name) {
     if (instances[name]) {
       instances[name].dispose();
       delete instances[name];
+    }
+    if (observers[name]) {
+      observers[name].disconnect();
+      delete observers[name];
     }
   }
 
@@ -90,12 +117,17 @@
           return html;
         }
       }),
-      legend: { data: ['输入（缓存未命中）', '输入（缓存命中）', '输出 Tokens', '请求数'], top: 0 },
-      grid: { left: 60, right: 56, top: 36, bottom: 28 },
+      legend: {
+        data: ['输入（缓存未命中）', '输入（缓存命中）', '输出 Tokens', '请求数'],
+        top: 0,
+        itemGap: 14,
+        textStyle: { fontSize: 12 }
+      },
+      grid: { left: 8, right: 16, top: 40, bottom: 28, containLabel: true },
       xAxis: { type: 'category', data: labels, axisTick: { alignWithLabel: true } },
       yAxis: [
-        { type: 'value', name: 'Tokens', axisLabel: { formatter: function (v) { return fmt.abbrev(v); } } },
-        { type: 'value', name: '请求数', splitLine: { show: false }, axisLabel: { formatter: function (v) { return fmt.abbrev(v); } } }
+        { type: 'value', axisLabel: { formatter: function (v) { return fmt.abbrev(v); } } },
+        { type: 'value', splitLine: { show: false }, axisLabel: { formatter: function (v) { return fmt.abbrev(v); } } }
       ],
       series: [
         { name: '输入（缓存未命中）', type: 'bar', stack: 'tokens', data: uncached, barMaxWidth: 32 },
@@ -229,6 +261,7 @@
   window.BRU = window.BRU || {};
   window.BRU.charts = {
     init: init,
+    setOption: setOption,
     dispose: dispose,
     disposeAll: disposeAll,
     resizeAll: resizeAll,

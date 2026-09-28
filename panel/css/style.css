@@ -167,6 +167,10 @@ body {
 .conn-ok { color: #2ea043; border-color: rgba(46,160,67,.45); }
 .conn-ok .conn-icon { background: #2ea043; }
 .conn-ok .conn-icon::after { content: "✓"; }
+/* 受限访问（403）：Key 有效但被限制（如超量临时封禁），橙色警示 */
+.conn-restricted { color: var(--quota-over); border-color: rgba(245,166,35,.5); }
+.conn-restricted .conn-icon { background: var(--quota-over); }
+.conn-restricted .conn-icon::after { content: "!"; font-weight: bold; }
 .conn-fail { color: var(--danger); border-color: rgba(229,72,77,.45); }
 .conn-fail .conn-icon { background: var(--danger); }
 .conn-fail .conn-icon::after { content: "✕"; }

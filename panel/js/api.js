@@ -15,6 +15,10 @@
     if (status === 401) {
       return { status: 401, code: 'unauthorized', message: 'API Key 无效或已过期（401）' };
     }
+    if (status === 403) {
+      // 403 = Key 有效但被限制（如超量临时封禁）：鉴权已通过，仅资源不可访问
+      return { status: 403, code: 'restricted', message: 'API Key 有效但被限制访问（403），可能已被临时封禁' };
+    }
     if (typeof status === 'number') {
       return { status: status, code: 'http', message: '网关返回错误（HTTP ' + status + '）' };
     }
@@ -92,7 +96,9 @@
 
   /**
    * 连接测试：调稳定的 /v1/models
-   * 成功返回 { ok:true, consumer, models:[{id, credit, creditHistory}...], modelIds:[id...] }，失败返回 { ok:false, error }
+   * 成功返回 { ok:true, consumer, models:[{id, credit, creditHistory}...], modelIds:[id...] }
+   * 403 时返回 { ok:true, restricted:true, models:[], modelIds:[] }——Key 有效仅被限制（如超量封禁），
+   * 视为登录成功以放行用量查询；模型目录此时拿不到，由调用方回退本地缓存
    * credit 为当日生效计量系数；creditHistory 为版本历史 [{from, credit}] 按生效日升序
    * （函数旧版无 credit_history 时为空数组，面板回退"总量×当前系数"的平铺算法）
    */
@@ -123,7 +129,12 @@
           modelIds: models.map(function (m) { return m.id; })
         };
       },
-      function (err) { return { ok: false, error: err }; }
+      function (err) {
+        if (err && err.code === 'restricted') {
+          return { ok: true, restricted: true, consumer: '', models: [], modelIds: [], error: err };
+        }
+        return { ok: false, error: err };
+      }
     );
   }
 

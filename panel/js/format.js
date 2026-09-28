@@ -127,6 +127,14 @@
     return key.slice(0, 11) + '••••' + key.slice(-2);
   }
 
+  /** Date -> 'YYYY-MM-DD HH:MM'，模型目录缓存同步时间用 */
+  function dateTime(d) {
+    if (!d || !(d instanceof Date) || isNaN(d.getTime())) return '--';
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+      ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
   window.BRU = window.BRU || {};
   window.BRU.format = {
     fullNumber: fullNumber,
@@ -138,6 +146,7 @@
     shortDate: shortDate,
     timeOfDay: timeOfDay,
     todayStr: todayStr,
+    dateTime: dateTime,
     hourLabel: hourLabel,
     pctChange: pctChange,
     ppChange: ppChange,
